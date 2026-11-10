@@ -100,17 +100,17 @@ use dev_baro.{ Pascals, Barometer }
 use dev_thermo.{ TempMilliC, Thermometer }
 
 // The commands (Figure 4).
-let CMD_RESET   = 0x1E
-let CMD_D1      = 0x40
-let CMD_D2      = 0x50
-let CMD_ADC     = 0x00
-let CMD_PROM    = 0xA0
+let CMD_RESET = 0x1E
+let CMD_D1    = 0x40
+let CMD_D2    = 0x50
+let CMD_ADC   = 0x00
+let CMD_PROM  = 0xA0
 
 // The oversampling code for OSR 256, the fastest and the noisiest.
-pub const OSR_256  = 0
+pub const OSR_256 = 0
 
 // The oversampling code for OSR 512.
-pub const OSR_512  = 1
+pub const OSR_512 = 1
 
 // The oversampling code for OSR 1024.
 pub const OSR_1024 = 2
@@ -126,8 +126,8 @@ pub const OSR_4096 = 4
 pub const RESET_US = 3000
 
 // The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
-let I2C_HZ = 400000
-let SPI_HZ = 4000000
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
 let SPI_MODE = 3
 
 // The oversampling `attach` starts with: 4096, the finest.
@@ -201,8 +201,8 @@ pub fn spi_command<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, cmd:
 // Sends `cmd` and reads the `n` bytes that follow it into `dst` in one SPI
 // transaction.  The answer starts at the first byte clocked after the
 // command, so nothing is dropped.  `n` is at most 32.
-pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, cmd: Int,
-                                            n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, cmd: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push((cmd & 0xFF) as u8)
     dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)

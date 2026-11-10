@@ -335,23 +335,23 @@ fn ds_prom() -> Ms5611Prom
 fn prom_or_empty(o: ?Ms5611Prom) -> Ms5611Prom
     match o
         Some(p) => p
-        None => ms5611.prom_empty()
+        None    => ms5611.prom_empty()
 
 // The sample of an answer, or a sentinel no reading takes.
 fn sample_or(o: ?Ms5611Sample) -> Ms5611Sample
     match o
         Some(s) => s
-        None => Ms5611Sample { milli_c: -999999999, pa: -999999999 }
+        None    => Ms5611Sample { milli_c: -999999999, pa: -999999999 }
 
 fn pa_or(o: ?Pascals) -> Int
     match o
         Some(p) => p.pa
-        None => -999999999
+        None    => -999999999
 
 fn mc_or(o: ?TempMilliC) -> Int
     match o
         Some(t) => t.milli_c
-        None => -999999999
+        None    => -999999999
 
 fn state_with(prom: Ms5611Prom, osr: Int, d2: Int) -> Ms5611State
     Ms5611State { prom: prom, osr: osr, d2: d2 }

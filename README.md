@@ -15,6 +15,21 @@ driver's functions run over a double of the part that follows the data
 sheet's commands and bus protocols.  A reading from a part on a board has
 not been taken.
 
+## Install
+
+```sh
+novo pkg add ms5611-nv
+```
+
+The device program is `examples/baro_read.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+novo build --target=frdm-mcxn947 src/main.nv
+```
+
 ## The device program
 
 `examples/baro_read.nv` reads a breakout over I2C once a second and prints
@@ -90,8 +105,8 @@ Neither Nordic board package drives I2C yet.  `BoardI2c` is absent
 hardware there, every transfer is refused, and the program prints
 `ms5611: no answer`.  The build removes the code that follows the first
 bus read, so the two Nordic rows are the image without the driver's reading
-path.  The feature `features/embedded-devex/nordic-twim-i2c-driver.md` in
-the novo-lang repository tracks the missing driver.  The FRDM-MCXN947 board
+path.  The novo-lang
+repository tracks the missing driver as a feature.  The FRDM-MCXN947 board
 package drives I2C, and its row is the image with the driver's code in it.
 
 ### The effects
@@ -286,8 +301,7 @@ a real part has been checked, because none has been read.
 The sources read for this driver, for their fixes and not ported, are the
 data sheet above, Linux's `drivers/iio/pressure/ms5611_core.c` and
 Zephyr's `drivers/sensor/meas/ms5607`.  Embassy and esp-hal hold no
-barometer driver (`planning/PERIPHERAL-DRIVER-CANDIDATES.md`, section 3, in
-the novo-lang repository).  Each fix kept is named in `src/ms5611.nv` where
+barometer driver.  Each fix kept is named in `src/ms5611.nv` where
 it is kept:
 
 - Zephyr divides where Linux shifts, which differ by one count where an

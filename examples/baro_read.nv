@@ -57,6 +57,6 @@ fn main() [hw]
                 field(" mC=", s.milli_c)
                 field(" Pa=", s.pa)
                 hal.uart.write("\n")
-            None =>
+            None    =>
                 hal.uart.write("ms5611: no result\n")
         hal.timer.delay_ms(1000)
