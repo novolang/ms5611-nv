@@ -78,18 +78,21 @@ bash tests/device_build.sh
 |---|---|---|---|
 | `nrf52840-dk` | 12,944 B | 1,282 B | 2,660 B |
 | `nrf54lm20-dk` | 13,700 B | 1,240 B | 2,644 B |
+| `frdm-mcxn947` | 24,308 B | 8,678 B | 2,748 B |
 
 The numbers are from the build's memory report.  Flash also holds the
 runtime, the compiler's support library and the program's tables.  The
-arena, 65,536 B on both boards, is the runtime's heap and is reserved
-whether or not the program uses it.  The compensation is integer
-arithmetic; the image holds no floating-point support.
+arena, 65,536 B on the Nordic boards, is the runtime's heap and is reserved
+whether or not the program uses it.  The compensation is 64-bit integer
+arithmetic.
 
 Neither Nordic board package drives I2C yet.  `BoardI2c` is absent
 hardware there, every transfer is refused, and the program prints
-`ms5611: no answer`.  The feature
-`features/embedded-devex/nordic-twim-i2c-driver.md` in the novo-lang
-repository tracks the missing driver.
+`ms5611: no answer`.  The build removes the code that follows the first
+bus read, so the two Nordic rows are the image without the driver's reading
+path.  The feature `features/embedded-devex/nordic-twim-i2c-driver.md` in
+the novo-lang repository tracks the missing driver.  The FRDM-MCXN947 board
+package drives I2C, and its row is the image with the driver's code in it.
 
 ### The effects
 

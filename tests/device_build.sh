@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # tests/device_build.sh — builds the device program,
-# examples/baro_read.nv, for two boards and reports the image
+# examples/baro_read.nv, for three boards and reports the image
 # sizes.
 #
 # The program is a firmware `main`, so it is built as the `main` of a
 # scratch package that depends on this one by path, the way a program on
 # a device depends on it.  The boards are the Nordic nRF52840-DK and
-# nRF54LM20-DK.  Nothing is flashed.  The emulated board's image
+# nRF54LM20-DK, whose board packages answer for I2C as absent hardware, and
+# the NXP FRDM-MCXN947, whose package drives I2C and so builds the whole
+# reading path.  Nothing is flashed.  The emulated board's image
 # (nrf52-qemu) is then run under QEMU, where no device answers on the
 # I2C bus, and its first line must be the program's refusal.
 #
@@ -34,7 +36,7 @@ embedded-hal-nv = "^0.3.2"
 EOF
 
 fail=0
-for target in nrf52840-dk nrf54lm20-dk nrf52-qemu; do
+for target in nrf52840-dk nrf54lm20-dk frdm-mcxn947 nrf52-qemu; do
   rm -f "$WORK/main.elf"
   ( cd "$WORK" && NOVO_LEAK_CHECK=0 timeout 900 "$NOVO" build --target="$target" src/main.nv ) \
     > "$WORK/$target.log" 2>&1
