@@ -106,11 +106,19 @@ let CMD_D2      = 0x50
 let CMD_ADC     = 0x00
 let CMD_PROM    = 0xA0
 
-// The oversampling codes: 0 to 4 for OSR 256, 512, 1024, 2048 and 4096.
+// The oversampling code for OSR 256, the fastest and the noisiest.
 pub const OSR_256  = 0
+
+// The oversampling code for OSR 512.
 pub const OSR_512  = 1
+
+// The oversampling code for OSR 1024.
 pub const OSR_1024 = 2
+
+// The oversampling code for OSR 2048.
 pub const OSR_2048 = 3
+
+// The oversampling code for OSR 4096, the finest and the slowest.
 pub const OSR_4096 = 4
 
 // The time to wait after a reset, in microseconds: the 2.8 ms of the
