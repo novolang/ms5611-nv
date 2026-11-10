@@ -892,6 +892,7 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     var p = Ms5611.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, i2c_wiring())
     let t = BoardTimer { id: 0 }
     test.assert(not p.begin(t))
+    test.assert(not p.begin(timer()))
     test.assert(not p.reset())
     test.assert(not p.load_prom())
     test.assert_eq(p.prom().words.len(), 8)
@@ -904,6 +905,7 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert_eq(p.osr(), 2)
     test.assert(not p.take_temperature())
     test.assert_eq(sample_or(p.sample(t)).pa, -999999999)
+    test.assert_eq(sample_or(p.sample(timer())).pa, -999999999)
     test.assert_eq(p.baro_start(), -1)
     test.assert_eq(pa_or(p.baro_read()), -999999999)
     test.assert_eq(p.temp_start(), -1)
@@ -915,6 +917,7 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     var p = Ms5611Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
     let t = BoardTimer { id: 0 }
     test.assert(not p.begin(t))
+    test.assert(not p.begin(timer()))
     test.assert(not p.reset())
     test.assert(not p.load_prom())
     test.assert_eq(p.prom().words[1], 0)
@@ -925,6 +928,7 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(not p.set_osr(-1))
     test.assert(not p.take_temperature())
     test.assert_eq(sample_or(p.sample(t)).pa, -999999999)
+    test.assert_eq(sample_or(p.sample(timer())).pa, -999999999)
     test.assert_eq(p.baro_start(), -1)
     test.assert_eq(pa_or(p.baro_read()), -999999999)
     test.assert_eq(p.temp_start(), -1)

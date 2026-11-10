@@ -41,10 +41,6 @@ pressure sensor on an I2C or an SPI bus.
 - The divisions of the compensation are arithmetic shifts (round toward
   minus infinity), as in Linux; Zephyr's MS5607 driver divides (round
   toward zero).  The two differ by one count below 20 °C.
-- `begin` and `sample` take the board's timer, `BoardTimer`, not a type
-  parameter, because of
-  `codegen-llvm/a-generic-method-instantiated-from-another-module-calls-its-modules-generic-function-unspecialised`.
-  The generic forms are the functions `ms5611.start` and `ms5611.measure`.
 - No async form: `async fn` is refused at the embedded tier.
 - The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
   board packages answer for I2C and SPI as absent hardware: on those
