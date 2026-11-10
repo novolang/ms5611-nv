@@ -1,0 +1,931 @@
+// ms5611_tests — the driver over a double of the part: a command
+// interpreter that answers on an I2C bus and on an SPI bus the way TE
+// Connectivity's data sheet (DA5611-01BA03_011, 06/2017) says an
+// MS5611-01BA03 does, with its five commands, its eight-word PROM, its
+// conversions whose ADC read answers 0 before they end and after the
+// result was read once, and its SPI answer that starts at the byte after
+// the command, so the framing, the PROM check, the compensation and the
+// bring-up are checked on the host, one transaction at a time.  The log
+// keeps what the controller sent, in a form the tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the command, the count, -1; an SPI transaction
+// is 3, the bytes the controller clocked out, -1.
+//
+// The compensation is checked against the data sheet's worked example
+// (Figure 2) and against vectors computed by a separate transcription of
+// Figure 2 and Figure 3 in Python integers with arithmetic shifts, for
+// the branches the example does not reach.  The PROM CRC is checked
+// against a separate transcription of the algorithm of AN520.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut, Timer }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_baro.{ Pascals, Barometer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use ms5611
+use ms5611.{ Ms5611, Ms5611Spi, Ms5611Prom, Ms5611State, Ms5611Sample, Ms5611Port }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `prom` is the PROM's eight words and `adc` the results of the two
+// conversions, key 1 for D1 and key 2 for D2.  `st` is the double's
+// state: 4 is 1 when a part is there, 5 the I2C address it answers at,
+// 10 the conversion started and not yet read (0 none, 1 D1, 2 D2), 11 the
+// oversampling code it was started with, 12 is 1 while a conversion has
+// not ended, 20 and 21 the SPI clock and mode, 22 the I2C clock, 40 the
+// resets seen, 41 the PROM reads that still answer (-1 for all), 50 the
+// SPI phase (0 before the command, 1 after it), 51 the next SPI answer
+// byte, 52 to 54 the SPI answer, 42 the I2C commands still acknowledged
+// before the part leaves the bus (0 for no limit), 99 the entries in the
+// log.
+
+struct Chip
+    prom: HashMap<Int, Int>
+    adc: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The PROM of the data sheet's example: word 0 factory data, C1 to C6 of
+// Figure 2, and word 7 holding the serial code 0x123 and the CRC 13.
+fn chip() -> Chip
+    let c = Chip { prom: HashMap.new(), adc: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    c.prom.insert(0, 0x3C28)
+    c.prom.insert(1, 40127)
+    c.prom.insert(2, 36924)
+    c.prom.insert(3, 23317)
+    c.prom.insert(4, 23282)
+    c.prom.insert(5, 33464)
+    c.prom.insert(6, 28312)
+    c.prom.insert(7, 0x123D)
+    c.adc.insert(1, 9085466)
+    c.adc.insert(2, 8569150)
+    c.st.insert(4, 1)
+    c.st.insert(5, 0x76)
+    c.st.insert(41, -1)
+    c
+
+// Appends a value to the log.
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// A command that sends nothing back: the reset, which clears a
+// conversion, and the ten conversion commands, which start one.  Answers
+// whether the command is one.
+fn chip_cmd(c: Chip, cmd: Int) -> Bool
+    if cmd == 0x1E
+        c.st.insert(40, at(c.st, 40) + 1)
+        c.st.insert(10, 0)
+        return true
+    if cmd >= 0x40 and cmd <= 0x48 and cmd % 2 == 0
+        c.st.insert(10, 1)
+        c.st.insert(11, (cmd - 0x40) / 2)
+        return true
+    if cmd >= 0x50 and cmd <= 0x58 and cmd % 2 == 0
+        c.st.insert(10, 2)
+        c.st.insert(11, (cmd - 0x50) / 2)
+        return true
+    false
+
+// The bytes a read command answers, `n` of them: the ADC result, 3 bytes
+// MSB first, which is 0 when no conversion is pending or it has not
+// ended, and clears the pending conversion when it was a result; or a
+// PROM word, 2 bytes MSB first, of which the part answers a number and
+// then stops.
+@tier(app)
+fn chip_data(c: Chip, cmd: Int, n: Int) -> [u8]
+    var out: [u8] = []
+    if cmd == 0x00
+        var v = 0
+        let kind = at(c.st, 10)
+        if kind != 0 and at(c.st, 12) == 0
+            v = at(c.adc, kind)
+            c.st.insert(10, 0)
+        list.push(out, ((v >> 16) & 0xFF) as u8)
+        list.push(out, ((v >> 8) & 0xFF) as u8)
+        list.push(out, (v & 0xFF) as u8)
+        return out
+    let left = at(c.st, 41)
+    if left == 0
+        return out
+    if left > 0
+        c.st.insert(41, left - 1)
+    let w = at(c.prom, (cmd - 0xA0) / 2)
+    list.push(out, ((w >> 8) & 0xFF) as u8)
+    list.push(out, (w & 0xFF) as u8)
+    out
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0 or data.len() != 1
+            return false
+        // st 42 is the commands still acknowledged, 0 for all of them.
+        let left = at(self.c.st, 42)
+        if left < 0
+            return false
+        if left > 0
+            self.c.st.insert(42, left - 1)
+            if left == 1
+                self.c.st.insert(42, -1)
+        chip_cmd(self.c, data[0] as Int)
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 5) or at(self.c.st, 4) == 0
+            return None
+        let out = chip_data(self.c, tx[0] as Int, n)
+        if out.len() != n
+            return None
+        Some(out)
+
+// The SPI double: the chip select falling starts a transaction.  The
+// first byte is the command; a command with no answer runs at once, and a
+// read command prepares its answer, which the bytes after the command
+// clock out, with no dummy byte between.
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    @tier(app)
+    fn transfer(self, b: Int) -> Int [hw]
+        log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 50) == 0
+            self.c.st.insert(50, 1)
+            self.c.st.insert(51, 0)
+            self.c.st.insert(52, 0xFF)
+            self.c.st.insert(53, 0xFF)
+            self.c.st.insert(54, 0xFF)
+            if not chip_cmd(self.c, b)
+                let out = chip_data(self.c, b, 0)
+                var i = 0
+                for x in out
+                    self.c.st.insert(52 + i, x as Int)
+                    i = i + 1
+            return 0xFF
+        let k = at(self.c.st, 51)
+        self.c.st.insert(51, k + 1)
+        if k > 2
+            return 0xFF
+        at(self.c.st, 52 + k)
+
+    @tier(app)
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(50, 0)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1
+            log_push(self.c, -1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// A timer that records each wait in microseconds; key -1 holds the count.
+struct FakeTimer
+    log: HashMap<Int, Int>
+
+impl Timer for FakeTimer
+    fn delay_us(self, us: Int) [hw]
+        let n = at(self.log, -1)
+        self.log.insert(n, us)
+        self.log.insert(-1, n + 1)
+
+@tier(app)
+fn timer() -> FakeTimer
+    FakeTimer { log: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Ms5611Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        ms5611.i2c_setup(self.bus, self.w)
+
+    fn command(self, cmd: Int) -> Bool [hw]
+        ms5611.i2c_command(self.bus, self.w, cmd)
+
+    fn read(self, cmd: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        ms5611.i2c_read_into(self.bus, self.w, cmd, n, var dst)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Ms5611Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        ms5611.spi_setup(self.bus, self.pins, self.w)
+
+    fn command(self, cmd: Int) -> Bool [hw]
+        ms5611.spi_command(self.bus, self.pins, self.w, cmd)
+
+    fn read(self, cmd: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        ms5611.spi_read_into(self.bus, self.pins, self.w, cmd, n, var dst)
+
+// The board's wiring: the part at 0x76 on I2C (CSB high), and on SPI with
+// the chip select on pin 67.
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x76)
+
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_spi(0, 67)
+
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// The waits a timer recorded.
+fn waits_are(t: FakeTimer, want: [Int])
+    test.assert_eq(at(t.log, -1), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(t.log, i), want[i])
+
+// A PROM of the given eight words.
+fn prom_of(a: Int, b: Int, c1: Int, c2: Int, c3: Int, c4: Int, c5: Int, c6: Int) -> Ms5611Prom
+    var words: Vec[Int; 8] = Vec.new()
+    let _ = words.push(a)
+    let _ = words.push(b)
+    let _ = words.push(c1)
+    let _ = words.push(c2)
+    let _ = words.push(c3)
+    let _ = words.push(c4)
+    let _ = words.push(c5)
+    let _ = words.push(c6)
+    Ms5611Prom { words: words }
+
+// The PROM of the data sheet's example, with the serial code and CRC the
+// double holds.
+fn ds_prom() -> Ms5611Prom
+    prom_of(0x3C28, 40127, 36924, 23317, 23282, 33464, 28312, 0x123D)
+
+// The PROM of an answer, or eight zero words.
+fn prom_or_empty(o: ?Ms5611Prom) -> Ms5611Prom
+    match o
+        Some(p) => p
+        None => ms5611.prom_empty()
+
+// The sample of an answer, or a sentinel no reading takes.
+fn sample_or(o: ?Ms5611Sample) -> Ms5611Sample
+    match o
+        Some(s) => s
+        None => Ms5611Sample { milli_c: -999999999, pa: -999999999 }
+
+fn pa_or(o: ?Pascals) -> Int
+    match o
+        Some(p) => p.pa
+        None => -999999999
+
+fn mc_or(o: ?TempMilliC) -> Int
+    match o
+        Some(t) => t.milli_c
+        None => -999999999
+
+fn state_with(prom: Ms5611Prom, osr: Int, d2: Int) -> Ms5611State
+    Ms5611State { prom: prom, osr: osr, d2: d2 }
+
+fn ready_state() -> Ms5611State
+    state_with(ds_prom(), 4, 0)
+
+// ── The constants and the conversion times ───────────────────────────
+
+@test
+fn test_the_conversion_times_are_the_data_sheets_maximum_column() [io, hw]
+    test.assert_eq(ms5611.conversion_us(0), 600)
+    test.assert_eq(ms5611.conversion_us(1), 1170)
+    test.assert_eq(ms5611.conversion_us(2), 2280)
+    test.assert_eq(ms5611.conversion_us(3), 4540)
+    test.assert_eq(ms5611.conversion_us(4), 9040)
+    test.assert_eq(ms5611.conversion_us(5), -1)
+    test.assert_eq(ms5611.conversion_us(-1), -1)
+
+@test
+fn test_the_oversampling_codes_name_the_five_ratios() [io, hw]
+    test.assert_eq(ms5611.osr_ratio(ms5611.OSR_256), 256)
+    test.assert_eq(ms5611.osr_ratio(ms5611.OSR_512), 512)
+    test.assert_eq(ms5611.osr_ratio(ms5611.OSR_1024), 1024)
+    test.assert_eq(ms5611.osr_ratio(ms5611.OSR_2048), 2048)
+    test.assert_eq(ms5611.osr_ratio(ms5611.OSR_4096), 4096)
+    test.assert_eq(ms5611.osr_ratio(5), 0)
+    test.assert_eq(ms5611.osr_ratio(-1), 0)
+    test.assert_eq(ms5611.RESET_US, 3000)
+
+// ── The framing of the two buses ─────────────────────────────────────
+
+@test
+fn test_an_i2c_command_is_a_one_byte_write() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(ms5611.part_reset(d))
+    log_is(c, [1, 0x76, 0x1E, -1])
+    test.assert_eq(at(c.st, 40), 1)
+
+@test
+fn test_an_i2c_read_is_the_command_then_a_repeated_start() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read(0xA2, 2, var b))
+    log_is(c, [2, 0x76, 0xA2, 2, -1])
+    test.assert_eq(b.len(), 2)
+    test.assert_eq((b[0] as Int << 8) | b[1] as Int, 40127)
+
+@test
+fn test_the_i2c_address_follows_the_csb_pin() [io, hw]
+    let c = chip()
+    c.st.insert(5, 0x77)
+    // CSB low: the part answers at 0x77, and nothing at 0x76.
+    let low = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x77) }
+    test.assert(ms5611.part_reset(low))
+    log_is(c, [1, 0x77, 0x1E, -1])
+    let high = i2c_dut(c)
+    test.assert(not ms5611.part_reset(high))
+    test.assert(ms5611.prom_word(high, 1) == None)
+
+@test
+fn test_an_spi_command_is_one_byte_in_one_window() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(ms5611.part_reset(d))
+    log_is(c, [3, 0x1E, -1])
+    test.assert_eq(at(c.st, 40), 1)
+    test.assert_eq(at(d.pins.levels, 67), 1)
+
+@test
+fn test_an_spi_read_has_no_dummy_byte() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read(0xA4, 2, var b))
+    // The command, then two bytes of 0xFF clocked out while the answer
+    // clocks in; the first byte after the command is data.
+    log_is(c, [3, 0xA4, 0xFF, 0xFF, -1])
+    test.assert_eq(b.len(), 2)
+    test.assert_eq((b[0] as Int << 8) | b[1] as Int, 36924)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_ones() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert(ms5611.adc_read(d) == Some(0xFFFFFF))
+    test.assert(not ms5611.prom_valid(prom_or_empty(ms5611.prom_read(d))))
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x76) }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read(0xA0, 2, var b))
+    test.assert(not d.command(0x1E))
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: spi_wiring() }
+    test.assert(not d.setup())
+    test.assert(not d.command(0x1E))
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_i2c_setup_makes_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_every_oversampling_has_its_own_pressure_and_temperature_command() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var want_us: [Int] = [600, 1170, 2280, 4540, 9040]
+    for k in 0..5
+        test.assert_eq(ms5611.start_pressure(d, k), want_us[k])
+        log_is(c, [1, 0x76, 0x40 + 2 * k, -1])
+        test.assert_eq(ms5611.start_temperature(d, k), want_us[k])
+        log_is(c, [1, 0x76, 0x50 + 2 * k, -1])
+
+@test
+fn test_a_conversion_at_a_code_outside_the_range_sends_nothing() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(ms5611.start_pressure(d, 5), -1)
+    test.assert_eq(ms5611.start_temperature(d, -1), -1)
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_conversion_the_part_does_not_acknowledge_answers_minus_one() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert_eq(ms5611.start_pressure(d, 4), -1)
+    test.assert_eq(ms5611.start_temperature(d, 4), -1)
+
+@test
+fn test_the_adc_result_is_24_bits_msb_first() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.adc.insert(1, 0xABCDEF)
+    test.assert_eq(ms5611.start_pressure(d, 4), 9040)
+    log_clear(c)
+    test.assert(ms5611.adc_read(d) == Some(0xABCDEF))
+    log_is(c, [2, 0x76, 0x00, 3, -1])
+
+@test
+fn test_an_adc_read_before_the_conversion_ends_is_no_result_and_the_conversion_goes_on() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let _ = ms5611.start_temperature(d, 4)
+    c.st.insert(12, 1)
+    test.assert(ms5611.adc_read(d) == None)
+    c.st.insert(12, 0)
+    test.assert(ms5611.adc_read(d) == Some(8569150))
+
+@test
+fn test_a_second_adc_read_of_one_result_is_no_result() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let _ = ms5611.start_pressure(d, 0)
+    test.assert(ms5611.adc_read(d) == Some(9085466))
+    test.assert(ms5611.adc_read(d) == None)
+
+@test
+fn test_an_adc_read_with_no_conversion_started_is_no_result() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(ms5611.adc_read(d) == None)
+    c.st.insert(4, 0)
+    test.assert(ms5611.adc_read(d) == None)
+
+@test
+fn test_the_adc_read_over_spi_is_the_same_result() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert_eq(ms5611.start_pressure(d, 2), 2280)
+    log_is(c, [3, 0x44, -1])
+    test.assert(ms5611.adc_read(d) == Some(9085466))
+    log_is(c, [3, 0x00, 0xFF, 0xFF, 0xFF, -1])
+    test.assert(ms5611.adc_read(d) == None)
+
+// ── The PROM ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_prom_word_is_read_by_its_own_command() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    for n in 0..8
+        test.assert(ms5611.prom_word(d, n) == Some(at(c.prom, n)))
+        log_is(c, [2, 0x76, 0xA0 + 2 * n, 2, -1])
+
+@test
+fn test_the_prom_is_eight_words_and_the_coefficients_are_words_1_to_6() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let p = prom_or_empty(ms5611.prom_read(d))
+    test.assert_eq(at(c.st, 99), 40)
+    test.assert_eq(p.words.len(), 8)
+    test.assert_eq(p.words[0], 0x3C28)
+    test.assert_eq(ms5611.coefficient(p, 1), 40127)
+    test.assert_eq(ms5611.coefficient(p, 2), 36924)
+    test.assert_eq(ms5611.coefficient(p, 3), 23317)
+    test.assert_eq(ms5611.coefficient(p, 4), 23282)
+    test.assert_eq(ms5611.coefficient(p, 5), 33464)
+    test.assert_eq(ms5611.coefficient(p, 6), 28312)
+    test.assert_eq(ms5611.coefficient(p, 0), 0)
+    test.assert_eq(ms5611.coefficient(p, 7), 0)
+    test.assert_eq(p.words[7], 0x123D)
+
+@test
+fn test_a_part_that_stops_answering_part_way_has_no_prom() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(41, 3)
+    test.assert(ms5611.prom_read(d) == None)
+    c.st.insert(41, 0)
+    test.assert(ms5611.prom_word(d, 0) == None)
+
+@test
+fn test_the_crc_of_the_data_sheets_prom_is_13() [io, hw]
+    let p = ds_prom()
+    test.assert_eq(ms5611.prom_crc4(p), 13)
+    test.assert(ms5611.prom_valid(p))
+
+@test
+fn test_the_crc_ignores_the_crc_field_and_the_low_byte_of_word_7() [io, hw]
+    // AN520 clears the low byte of word 7 before it runs: the serial
+    // code's low nibble and the CRC itself are not part of the sum.
+    let a = prom_of(0x3C28, 40127, 36924, 23317, 23282, 33464, 28312, 0x1230)
+    let b = prom_of(0x3C28, 40127, 36924, 23317, 23282, 33464, 28312, 0x12FF)
+    test.assert_eq(ms5611.prom_crc4(a), 13)
+    test.assert_eq(ms5611.prom_crc4(b), 13)
+    // The serial code's high byte is in the sum.
+    let d = prom_of(0x3C28, 40127, 36924, 23317, 23282, 33464, 28312, 0x1330)
+    test.assert(ms5611.prom_crc4(d) != 13)
+
+@test
+fn test_the_crc_matches_an_independent_transcription_of_an520() [io, hw]
+    // The bytes 0x31 0x32 ... 0x46 as eight words; the CRC is 11.
+    let p = prom_of(0x3132, 0x3334, 0x3536, 0x3738, 0x3940, 0x4142, 0x4344, 0x4546)
+    test.assert_eq(ms5611.prom_crc4(p), 11)
+    // Its CRC field is 6, so it is not a valid PROM.
+    test.assert(not ms5611.prom_valid(p))
+    let q = prom_of(0x3132, 0x3334, 0x3536, 0x3738, 0x3940, 0x4142, 0x4344, 0x454B)
+    test.assert(ms5611.prom_valid(q))
+
+@test
+fn test_a_changed_coefficient_or_crc_makes_the_prom_invalid() [io, hw]
+    test.assert(not ms5611.prom_valid(prom_of(0x3C28, 40126, 36924, 23317, 23282, 33464, 28312, 0x123D)))
+    test.assert(not ms5611.prom_valid(prom_of(0x3C28, 40127, 36924, 23317, 23282, 33464, 28312, 0x123C)))
+    test.assert(not ms5611.prom_valid(prom_of(0x3C29, 40127, 36924, 23317, 23282, 33464, 28312, 0x123D)))
+
+@test
+fn test_a_prom_of_all_zeros_or_all_ones_is_no_part() [io, hw]
+    // The CRC of eight zero words is 0, which a zero CRC field matches.
+    test.assert_eq(ms5611.prom_crc4(ms5611.prom_empty()), 0)
+    test.assert(not ms5611.prom_valid(ms5611.prom_empty()))
+    test.assert(not ms5611.prom_valid(prom_of(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF)))
+
+// ── The compensation ─────────────────────────────────────────────────
+
+@test
+fn test_the_data_sheets_worked_example_first_order() [io, hw]
+    let f = ms5611.first_order(ds_prom(), 9085466, 8569150)
+    test.assert_eq(f.dt, 2366)
+    test.assert_eq(f.temp, 2007)
+    test.assert_eq(f.off, 2420281617)
+    test.assert_eq(f.sens, 1315097036)
+    test.assert_eq(f.p, 100009)
+
+@test
+fn test_the_data_sheets_worked_example_compensated() [io, hw]
+    // 20.07 degC and 1000.09 mbar; at 20 degC and above no second order
+    // term applies, so the result is the first order one.
+    let s = ms5611.compensate(ds_prom(), 9085466, 8569150)
+    test.assert_eq(s.milli_c, 20070)
+    test.assert_eq(s.pa, 100009)
+    test.assert_eq(ms5611.temperature_centi(ds_prom(), 8569150), 2007)
+
+@test
+fn test_no_second_order_term_at_20_degrees_and_one_at_19_99() [io, hw]
+    // D2 = C5 * 256 is dT = 0 and TEMP = 2000 exactly.
+    let a = ms5611.compensate(ds_prom(), 9085466, 8566784)
+    test.assert_eq(a.milli_c, 20000)
+    test.assert_eq(a.pa, 99993)
+    // dT = -1 is TEMP = 1999: OFF2 = 2 and SENS2 = 1, T2 = 0.
+    let b = ms5611.compensate(ds_prom(), 9085466, 8566783)
+    test.assert_eq(b.milli_c, 19990)
+    test.assert_eq(b.pa, 99993)
+    let f = ms5611.first_order(ds_prom(), 9085466, 8566783)
+    test.assert_eq(f.temp, 1999)
+    test.assert_eq(f.off, 2419851082)
+    test.assert_eq(f.sens, 1314881444)
+
+@test
+fn test_below_20_degrees_the_second_order_terms_apply() [io, hw]
+    // D2 = 8000000: first order 0.87 degC and 963.14 mbar; with T2 = 149,
+    // OFF2 = 9148922 and SENS2 = 4574461 it is -0.62 degC and 959.89 mbar.
+    let s = ms5611.compensate(ds_prom(), 9085466, 8000000)
+    test.assert_eq(s.milli_c, -620)
+    test.assert_eq(s.pa, 95989)
+    let f = ms5611.first_order(ds_prom(), 9085466, 8000000)
+    test.assert_eq(f.dt, -566784)
+    test.assert_eq(f.temp, 87)
+    test.assert_eq(f.p, 96314)
+    test.assert_eq(ms5611.temperature_centi(ds_prom(), 8000000), -62)
+
+@test
+fn test_the_very_low_term_starts_below_minus_15_degrees() [io, hw]
+    // D2 = 7529764 is TEMP = -1500 exactly: no very low term.
+    let a = ms5611.compensate(ds_prom(), 9085466, 7529764)
+    test.assert_eq(a.milli_c, -20000)
+    test.assert_eq(a.pa, 92172)
+    // D2 = 7529763 is TEMP = -1501: OFF2 gains 7 and SENS2 gains 5.
+    let b = ms5611.compensate(ds_prom(), 9085466, 7529763)
+    test.assert_eq(b.milli_c, -20010)
+    test.assert_eq(b.pa, 92171)
+    // D2 = 6000000, far below: -97.31 degC and 629.59 mbar.
+    let c = ms5611.compensate(ds_prom(), 9085466, 6000000)
+    test.assert_eq(c.milli_c, -97310)
+    test.assert_eq(c.pa, 62959)
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_bring_up_resets_waits_and_reads_the_prom_over_i2c() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let t = timer()
+    var st = state_with(ms5611.prom_empty(), 4, 0)
+    test.assert(ms5611.start(d, t, var st))
+    waits_are(t, [3000])
+    test.assert_eq(at(c.st, 40), 1)
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(st.prom.words[1], 40127)
+    test.assert_eq(st.prom.words[7], 0x123D)
+    test.assert_eq(st.osr, 4)
+
+@test
+fn test_the_bring_up_over_spi_is_the_same_sequence() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    let t = timer()
+    var st = state_with(ms5611.prom_empty(), 4, 0)
+    test.assert(ms5611.start(d, t, var st))
+    waits_are(t, [3000])
+    test.assert_eq(at(c.st, 40), 1)
+    test.assert_eq(at(c.st, 21), 3)
+    test.assert_eq(st.prom.words[6], 28312)
+
+@test
+fn test_the_bring_up_refuses_a_prom_whose_crc_fails() [io, hw]
+    let c = chip()
+    c.prom.insert(3, 23318)
+    let d = i2c_dut(c)
+    let t = timer()
+    var st = state_with(ms5611.prom_empty(), 4, 0)
+    test.assert(not ms5611.start(d, t, var st))
+    waits_are(t, [3000])
+    test.assert_eq(st.prom.words[1], 0)
+
+@test
+fn test_the_bring_up_stops_at_each_refusal() [io, hw]
+    // A wiring that suits no bus: nothing is sent.
+    let c = chip()
+    let bad = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: spi_wiring() }
+    let t = timer()
+    var st = ready_state()
+    test.assert(not ms5611.start(bad, t, var st))
+    test.assert_eq(at(c.st, 99), 0)
+    // A part that does not acknowledge the reset: no wait is made.
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(not ms5611.start(d, t, var st))
+    waits_are(t, [])
+    // A part that resets and then stops answering the PROM.
+    c.st.insert(4, 1)
+    c.st.insert(41, 0)
+    test.assert(not ms5611.start(d, t, var st))
+    waits_are(t, [3000])
+
+@test
+fn test_a_part_that_is_not_there_has_no_valid_prom_over_spi() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    let t = timer()
+    var st = state_with(ms5611.prom_empty(), 4, 0)
+    test.assert(not ms5611.start(d, t, var st))
+    test.assert(not ms5611.prom_load(d, var st))
+
+@test
+fn test_the_reset_and_the_prom_load_can_be_run_apart() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var st = state_with(ms5611.prom_empty(), 4, 0)
+    test.assert(ms5611.part_reset(d))
+    test.assert(ms5611.prom_load(d, var st))
+    test.assert_eq(st.prom.words[5], 33464)
+
+// ── Readings ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_blocking_reading_converts_the_pressure_then_the_temperature() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let t = timer()
+    let s = sample_or(ms5611.measure(d, t, ready_state()))
+    test.assert_eq(s.milli_c, 20070)
+    test.assert_eq(s.pa, 100009)
+    waits_are(t, [9040, 9040])
+    log_is(c, [1, 0x76, 0x48, -1, 2, 0x76, 0x00, 3, -1, 1, 0x76, 0x58, -1, 2, 0x76, 0x00, 3, -1])
+
+@test
+fn test_a_blocking_reading_waits_the_time_of_the_oversampling_in_use() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    let t = timer()
+    let s = sample_or(ms5611.measure(d, t, state_with(ds_prom(), 0, 0)))
+    test.assert_eq(s.milli_c, 20070)
+    test.assert_eq(s.pa, 100009)
+    waits_are(t, [600, 600])
+    log_is(c, [3, 0x40, -1, 3, 0x00, 0xFF, 0xFF, 0xFF, -1, 3, 0x50, -1, 3, 0x00, 0xFF, 0xFF, 0xFF, -1])
+
+@test
+fn test_a_blocking_reading_gives_no_result_when_a_step_fails() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let t = timer()
+    // The PROM was never loaded.
+    test.assert_eq(sample_or(ms5611.measure(d, t, state_with(ms5611.prom_empty(), 4, 0))).pa, -999999999)
+    test.assert_eq(at(c.st, 99), 0)
+    // An oversampling code the part does not have.
+    test.assert_eq(sample_or(ms5611.measure(d, t, state_with(ds_prom(), 9, 0))).pa, -999999999)
+    // A part that does not acknowledge the first command.
+    c.st.insert(4, 0)
+    test.assert_eq(sample_or(ms5611.measure(d, t, ready_state())).pa, -999999999)
+    waits_are(t, [])
+    c.st.insert(4, 1)
+    // A first conversion that has not ended when the result is read.
+    c.st.insert(12, 1)
+    test.assert_eq(sample_or(ms5611.measure(d, t, ready_state())).pa, -999999999)
+    c.st.insert(12, 0)
+    // A pressure of zero is no result.
+    c.adc.insert(1, 0)
+    test.assert_eq(sample_or(ms5611.measure(d, t, ready_state())).pa, -999999999)
+    // A temperature of zero is no result.
+    c.adc.insert(1, 9085466)
+    c.adc.insert(2, 0)
+    test.assert_eq(sample_or(ms5611.measure(d, t, ready_state())).pa, -999999999)
+
+@test
+fn test_a_blocking_reading_stops_when_the_part_leaves_after_the_first_conversion() [io, hw]
+    // The part acknowledges one command and then stops: the pressure is
+    // read, and the temperature conversion is refused.
+    let c = chip()
+    let d = i2c_dut(c)
+    let t = timer()
+    c.st.insert(42, 1)
+    test.assert_eq(sample_or(ms5611.measure(d, t, ready_state())).pa, -999999999)
+    waits_are(t, [9040])
+
+@test
+fn test_the_thermometer_reads_the_temperature_with_the_second_order_term() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let st = ready_state()
+    test.assert_eq(ms5611.start_temperature(d, 4), 9040)
+    test.assert_eq(mc_or(ms5611.temp_read_of(d, st)), 20070)
+    c.adc.insert(2, 8000000)
+    let _ = ms5611.start_temperature(d, 4)
+    test.assert_eq(mc_or(ms5611.temp_read_of(d, st)), -620)
+
+@test
+fn test_the_thermometer_gives_nothing_without_a_prom_or_a_result() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let _ = ms5611.start_temperature(d, 4)
+    test.assert_eq(mc_or(ms5611.temp_read_of(d, state_with(ms5611.prom_empty(), 4, 0))), -999999999)
+    test.assert_eq(mc_or(ms5611.temp_read_of(d, ready_state())), 20070)
+    test.assert_eq(mc_or(ms5611.temp_read_of(d, ready_state())), -999999999)
+
+@test
+fn test_the_barometer_needs_a_temperature_taken_first() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var st = ready_state()
+    let _ = ms5611.start_pressure(d, 4)
+    // No temperature yet: no pressure, and the result stays unread.
+    test.assert_eq(pa_or(ms5611.baro_read_of(d, st)), -999999999)
+    // The temperature conversion, taken into the state.
+    let _ = ms5611.start_temperature(d, 4)
+    test.assert(ms5611.temperature_take(d, var st))
+    test.assert_eq(st.d2, 8569150)
+    // A second take finds no result and leaves the state alone.
+    test.assert(not ms5611.temperature_take(d, var st))
+    test.assert_eq(st.d2, 8569150)
+    let _ = ms5611.start_pressure(d, 4)
+    test.assert_eq(pa_or(ms5611.baro_read_of(d, st)), 100009)
+    // The same result is not read twice.
+    test.assert_eq(pa_or(ms5611.baro_read_of(d, st)), -999999999)
+
+@test
+fn test_the_barometer_gives_nothing_without_a_prom() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let _ = ms5611.start_pressure(d, 4)
+    test.assert_eq(pa_or(ms5611.baro_read_of(d, state_with(ms5611.prom_empty(), 4, 8569150))), -999999999)
+
+// ── The device types over absent hardware ────────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// two types that forward to the functions above, and the state they keep.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    var p = Ms5611.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, i2c_wiring())
+    let t = BoardTimer { id: 0 }
+    test.assert(not p.begin(t))
+    test.assert(not p.reset())
+    test.assert(not p.load_prom())
+    test.assert_eq(p.prom().words.len(), 8)
+    test.assert_eq(p.prom().words[1], 0)
+    test.assert_eq(p.osr(), 4)
+    test.assert(p.set_osr(2))
+    test.assert_eq(p.osr(), 2)
+    test.assert(not p.set_osr(5))
+    test.assert(not p.set_osr(-1))
+    test.assert_eq(p.osr(), 2)
+    test.assert(not p.take_temperature())
+    test.assert_eq(sample_or(p.sample(t)).pa, -999999999)
+    test.assert_eq(p.baro_start(), -1)
+    test.assert_eq(pa_or(p.baro_read()), -999999999)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert_eq(mc_or(p.temp_read()), -999999999)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    var p = Ms5611Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    let t = BoardTimer { id: 0 }
+    test.assert(not p.begin(t))
+    test.assert(not p.reset())
+    test.assert(not p.load_prom())
+    test.assert_eq(p.prom().words[1], 0)
+    test.assert_eq(p.osr(), 4)
+    test.assert(p.set_osr(0))
+    test.assert_eq(p.osr(), 0)
+    test.assert(not p.set_osr(5))
+    test.assert(not p.set_osr(-1))
+    test.assert(not p.take_temperature())
+    test.assert_eq(sample_or(p.sample(t)).pa, -999999999)
+    test.assert_eq(p.baro_start(), -1)
+    test.assert_eq(pa_or(p.baro_read()), -999999999)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert_eq(mc_or(p.temp_read()), -999999999)

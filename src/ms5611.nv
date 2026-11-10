@@ -1,0 +1,640 @@
+// ms5611 — TE Connectivity's MS5611-01BA03 barometric pressure sensor, on
+// its I2C or its SPI bus, as devices-nv's `Barometer` and `Thermometer`.
+//
+// The facts below are from the data sheet "MS5611-01BA03 Barometric
+// Pressure Sensor, with stainless steel cap", TE Connectivity (Measurement
+// Specialties), document DA5611-01BA03_011, 06/2017; the figures and
+// sections named are that sheet's.  The data sheet gives the compensation
+// and no code for the PROM check; that is application note AN520, which
+// the data sheet names.  Where the sheet and the drivers read for this
+// one disagree, the site says which was taken.
+//
+// The part has five commands (Figure 4) and no registers to write:
+//
+//   0x1E        reset; the PROM reloads in 2.8 ms
+//   0x40 + 2k   convert D1, the pressure, at OSR 256 << k (k = 0 to 4)
+//   0x50 + 2k   convert D2, the temperature, at OSR 256 << k
+//   0x00        read the 24-bit ADC result, MSB first
+//   0xA0 + 2n   read the 16-bit PROM word n (n = 0 to 7), MSB first
+//
+// The PROM (Figure 16) is eight words.  Word 0 is factory data, words 1
+// to 6 are the calibration coefficients C1 to C6, and word 7 holds the
+// serial code in bits 15 to 4 and a 4-bit CRC in bits 3 to 0.
+//
+// A conversion takes the time of the data sheet's Conversion time row at
+// the oversampling ratio (OSR): 0.60, 1.17, 2.28, 4.54 and 9.04 ms at its
+// maximum column for OSR 256, 512, 1024, 2048 and 4096.  An ADC read
+// before the conversion ends answers 0, the conversion goes on, and the
+// result that follows is wrong (CONVERSION SEQUENCE).  A second
+// conversion command while one runs gives an incorrect result too.  So
+// the driver answers the maximum time for the caller to wait, and an
+// ADC result of 0 is "no result", never a pressure.
+//
+// The compensation (Figure 2 and Figure 3).  With D1 and D2 the two ADC
+// results and C1 to C6 the coefficients:
+//
+//   dT    = D2 - C5 * 2^8
+//   TEMP  = 2000 + dT * C6 / 2^23                      (0.01 degC)
+//   OFF   = C2 * 2^16 + C4 * dT / 2^7
+//   SENS  = C1 * 2^15 + C3 * dT / 2^8
+//   P     = (D1 * SENS / 2^21 - OFF) / 2^15            (0.01 mbar)
+//
+// and below 20 degC the second order terms, with TEMP the first order
+// value throughout:
+//
+//   T2    = dT^2 / 2^31
+//   OFF2  = 5 * (TEMP - 2000)^2 / 2
+//   SENS2 = 5 * (TEMP - 2000)^2 / 4
+//   below -15 degC:  OFF2  += 7 * (TEMP + 1500)^2
+//                    SENS2 += 11 * (TEMP + 1500)^2 / 2
+//   then TEMP -= T2, OFF -= OFF2, SENS -= SENS2, and P is computed again.
+//
+// 0.01 mbar is 1 Pa, so P is the pressure in pascals.  The data sheet's
+// worked example (C1 to C6 = 40127, 36924, 23317, 23282, 33464, 28312;
+// D1 = 9085466, D2 = 8569150) gives dT = 2366, TEMP = 2007, OFF =
+// 2420281617, SENS = 1315097036 and P = 100009.
+//
+// Fix kept: the divisions are written as arithmetic shifts, which round
+// toward minus infinity, as Linux's `drivers/iio/pressure/ms5611_core.c`
+// does; Zephyr's `drivers/sensor/meas/ms5607` divides, which rounds
+// toward zero.  The two differ by one count where dT or an intermediate
+// is negative, which is every reading below the reference temperature of
+// 20 degC.  The data sheet's example is positive and does not decide it;
+// the shift is taken because the sheet writes the divisors as powers of
+// two.
+//
+// Fix kept: Zephyr's MS5607 driver holds the MS5607's second order
+// constants (61 / 16, 2, 15 and 8) and its first order shifts (2^17,
+// 2^16, 2^6 and 2^7); the MS5611's are the ones above, and a driver that
+// takes the other part's reads a wrong pressure that is plausible.
+//
+// Fix kept: neither reference driver rejects an ADC result of 0 or a
+// PROM that reads all zeros or all ones, which is a part that is not
+// there (an SPI bus nothing drives reads 0xFF; a bus held low reads
+// 0x00).  The CRC of an all-zero PROM is 0, and so matches the CRC field
+// of an all-zero word 7; `prom_valid` refuses both.
+//
+// The CRC-4 (AN520) runs over the 16 bytes of the PROM with the CRC
+// field of word 7 cleared, as a CRC with the polynomial 0x3000 (x^12 +
+// x^13 on a 16-bit remainder) taken 8 bits at a time, and the result is
+// bits 15 to 12 of the remainder.  Linux's driver is the reference read.
+//
+// The two buses (INTERFACES).  On I2C the address is 111011Cx, where C
+// is the complement of the CSB pin: 0x76 with CSB high, 0x77 with CSB
+// low.  A PROM or ADC read is the command byte, a repeated start and the
+// data; a command alone is a one-byte write.  On SPI, mode 0 or 3 up to
+// 20 MHz, a transaction is the command byte and then the data clocked
+// out, inside one chip-select window; unlike the BMP390's, the answer
+// starts at the first byte after the command, with no dummy byte.
+//
+// A bus enters through `Ms5611Port`, which a type that holds a bus
+// implements: `Ms5611I2c` and `Ms5611Spi`.  The device types `Ms5611`
+// and `Ms5611Spi` hold a port and the state the driver keeps between
+// calls: the PROM, the oversampling and the last temperature result.
+// A trait method takes a plain `self`, so the state changes only through
+// the driver's own `var self` methods; the program holds the value.
+
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, BoardTimer, I2cBus, SpiBus, GpioOut, Timer }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_baro.{ Pascals, Barometer }
+use dev_thermo.{ TempMilliC, Thermometer }
+
+// The commands (Figure 4).
+let CMD_RESET   = 0x1E
+let CMD_D1      = 0x40
+let CMD_D2      = 0x50
+let CMD_ADC     = 0x00
+let CMD_PROM    = 0xA0
+
+// The oversampling codes: 0 to 4 for OSR 256, 512, 1024, 2048 and 4096.
+pub const OSR_256  = 0
+pub const OSR_512  = 1
+pub const OSR_1024 = 2
+pub const OSR_2048 = 3
+pub const OSR_4096 = 4
+
+// The time to wait after a reset, in microseconds: the 2.8 ms of the
+// reload (Figure 5), rounded up.
+pub const RESET_US = 3000
+
+// The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
+let I2C_HZ = 400000
+let SPI_HZ = 4000000
+let SPI_MODE = 3
+
+// The oversampling `attach` starts with: 4096, the finest.
+let OSR_DEFAULT = 4
+
+// The words of the PROM.
+let PROM_WORDS = 8
+
+// The PROM of the part: its eight words (Figure 16).  `words[0]` is the
+// factory data, `words[1]` to `words[6]` are C1 to C6, and `words[7]`
+// holds the serial code and the CRC.
+pub @value
+struct Ms5611Prom
+    words: Vec[Int; 8]
+
+// One reading, compensated: the temperature in millidegrees Celsius and
+// the pressure in pascals.
+pub @value
+struct Ms5611Sample
+    milli_c: Int
+    pa: Int
+
+// The first order result and its intermediates, in the data sheet's
+// units: `dt` and `temp` (0.01 degC), `off`, `sens`, and `p` (0.01 mbar,
+// which is pascals).
+pub @value
+struct Ms5611Calc
+    dt: Int
+    temp: Int
+    off: Int
+    sens: Int
+    p: Int
+
+// What the driver keeps between calls: the PROM, the oversampling code,
+// and the last D2 result a program took (0 for none).
+pub @value
+struct Ms5611State
+    prom: Ms5611Prom
+    osr: Int
+    d2: Int
+
+// A bus the part is on.  `setup` makes the bus ready and answers whether
+// the wiring suits it; `command` sends a command byte alone; `read` sends
+// a command byte and reads `n` bytes that follow it in one transaction.
+pub trait Ms5611Port
+    fn setup(self) -> Bool [hw]
+    fn command(self, cmd: Int) -> Bool [hw]
+    fn read(self, cmd: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+
+// ── The two buses ────────────────────────────────────────────────────
+
+// Sends `cmd` alone in one I2C write: whether the part acknowledged.
+pub fn i2c_command<B: I2cBus>(bus: B, w: DeviceWiring, cmd: Int) -> Bool [hw]
+    var none: DevBytes = Vec.new()
+    dev_bus.wiring_write_from(bus, w, cmd, none)
+
+// Sends `cmd` and reads `n` bytes into `dst` in one I2C transaction, a
+// write of the command and a repeated start: whether the part answered.
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, cmd: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, cmd, n, var dst)
+
+// Sends `cmd` alone in one SPI transaction: whether it ran, which is
+// whether the wiring has a chip select.
+pub fn spi_command<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, cmd: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((cmd & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var none)
+
+// Sends `cmd` and reads the `n` bytes that follow it into `dst` in one SPI
+// transaction.  The answer starts at the first byte clocked after the
+// command, so nothing is dropped.  `n` is at most 32.
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, cmd: Int,
+                                            n: Int, var dst: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((cmd & 0xFF) as u8)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
+
+// Makes an I2C bus ready: the bus at 400 kHz.  Answers whether the wiring
+// has an address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// Makes an SPI bus ready: chip select driven high first, so the pin
+// never drives low before the bus is ready, then an output; the bus at
+// 4 MHz in mode 3.  Answers whether the wiring has a chip select.
+pub fn spi_setup<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    gpio.set(cs, 1)
+    gpio.mode(cs, 1)
+    bus.init(SPI_HZ, SPI_MODE)
+    true
+
+// ── The commands ─────────────────────────────────────────────────────
+
+// Resets the part: whether it acknowledged.  The PROM reloads in
+// `RESET_US`, which the caller waits before `prom_read`.
+pub fn part_reset<P: Ms5611Port>(p: P) -> Bool [hw]
+    p.command(CMD_RESET)
+
+// The time a conversion at the oversampling code `osr` takes, in
+// microseconds: the maximum column of the data sheet's Conversion time
+// row, 0.60, 1.17, 2.28, 4.54 and 9.04 ms.  A code outside 0 to 4 is
+// -1.
+pub fn conversion_us(osr: Int) -> Int
+    if osr == 0
+        return 600
+    if osr == 1
+        return 1170
+    if osr == 2
+        return 2280
+    if osr == 3
+        return 4540
+    if osr == 4
+        return 9040
+    -1
+
+// The oversampling ratio an oversampling code means: 256 for 0 to 4096
+// for 4, and 0 for a code outside the range.
+pub fn osr_ratio(osr: Int) -> Int
+    if osr < 0 or osr > 4
+        return 0
+    256 << osr
+
+// Starts a conversion of the pressure (D1) at the oversampling code
+// `osr` and answers the time to wait before `adc_read`, in microseconds.
+// -1 for a code outside 0 to 4 or a part that did not acknowledge.
+pub fn start_pressure<P: Ms5611Port>(p: P, osr: Int) -> Int [hw]
+    start_conversion(p, CMD_D1, osr)
+
+// Starts a conversion of the temperature (D2); see `start_pressure`.
+pub fn start_temperature<P: Ms5611Port>(p: P, osr: Int) -> Int [hw]
+    start_conversion(p, CMD_D2, osr)
+
+fn start_conversion<P: Ms5611Port>(p: P, base: Int, osr: Int) -> Int [hw]
+    let us = conversion_us(osr)
+    if us < 0
+        return -1
+    if not p.command(base + 2 * osr)
+        return -1
+    us
+
+// The result of the conversion, 24 bits, or `None` when the part did not
+// answer or answered 0.  The part answers 0 for a read before the
+// conversion ended, for a second read of one result, and for a read with
+// no conversion started; a conversion of 0 is not a result it gives.
+pub fn adc_read<P: Ms5611Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read(CMD_ADC, 3, var b)
+        return None
+    let v = (b[0] as Int << 16) | (b[1] as Int << 8) | b[2] as Int
+    if v == 0
+        return None
+    Some(v)
+
+// ── The PROM ─────────────────────────────────────────────────────────
+
+// The PROM word `n`, 0 to 7, or `None` when the part did not answer.
+pub fn prom_word<P: Ms5611Port>(p: P, n: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read(CMD_PROM + 2 * n, 2, var b)
+        return None
+    Some((b[0] as Int << 8) | b[1] as Int)
+
+// A PROM of eight zero words, the state before `load_prom`.
+pub fn prom_empty() -> Ms5611Prom
+    var words: Vec[Int; 8] = Vec.new()
+    for _i in 0..PROM_WORDS
+        let _ = words.push(0)
+    Ms5611Prom { words: words }
+
+// The eight words of the PROM, or `None` when the part stopped answering
+// part way.
+pub fn prom_read<P: Ms5611Port>(p: P) -> ?Ms5611Prom [hw]
+    var words: Vec[Int; 8] = Vec.new()
+    for n in 0..PROM_WORDS
+        let Some(v) = prom_word(p, n) else return None
+        let _ = words.push(v)
+    Some(Ms5611Prom { words: words })
+
+// The coefficient `n`, 1 to 6, of a PROM; 0 for another number.
+pub fn coefficient(prom: Ms5611Prom, n: Int) -> Int
+    if n < 1 or n > 6
+        return 0
+    prom.words[n]
+
+// The 4-bit CRC of a PROM by AN520: the remainder over the 16 bytes
+// with the CRC field of word 7 cleared, polynomial 0x3000, high nibble.
+pub fn prom_crc4(prom: Ms5611Prom) -> Int
+    var rem = 0
+    for i in 0..16
+        var word = prom.words[i >> 1]
+        if i == 14 or i == 15
+            word = word & 0xFF00
+        if (i & 1) == 1
+            rem = rem ^ (word & 0x00FF)
+        else
+            rem = rem ^ (word >> 8)
+        for _bit in 0..8
+            if (rem & 0x8000) != 0
+                rem = ((rem << 1) ^ 0x3000) & 0xFFFF
+            else
+                rem = (rem << 1) & 0xFFFF
+    (rem >> 12) & 0xF
+
+// Whether a PROM is a part's: its CRC field matches `prom_crc4`, and it
+// is not eight words of 0x0000 or of 0xFFFF, which is what a bus that
+// nothing drives reads.
+pub fn prom_valid(prom: Ms5611Prom) -> Bool
+    var zeros = true
+    var ones = true
+    for i in 0..PROM_WORDS
+        if prom.words[i] != 0
+            zeros = false
+        if prom.words[i] != 0xFFFF
+            ones = false
+    if zeros or ones
+        return false
+    (prom.words[7] & 0xF) == prom_crc4(prom)
+
+// ── Compensation ─────────────────────────────────────────────────────
+
+// The first order result of the data sheet's Figure 2 for the ADC results
+// `d1` and `d2`.
+pub fn first_order(prom: Ms5611Prom, d1: Int, d2: Int) -> Ms5611Calc
+    let c1 = prom.words[1]
+    let c2 = prom.words[2]
+    let c3 = prom.words[3]
+    let c4 = prom.words[4]
+    let c5 = prom.words[5]
+    let c6 = prom.words[6]
+    let dt = d2 - (c5 << 8)
+    let temp = 2000 + ((c6 * dt) >> 23)
+    let off = (c2 << 16) + ((c4 * dt) >> 7)
+    let sens = (c1 << 15) + ((c3 * dt) >> 8)
+    let p = (((d1 * sens) >> 21) - off) >> 15
+    Ms5611Calc { dt: dt, temp: temp, off: off, sens: sens, p: p }
+
+// The temperature in 0.01 degC with the second order term of Figure 3:
+// below 20 degC, TEMP - dT^2 / 2^31.
+pub fn temperature_centi(prom: Ms5611Prom, d2: Int) -> Int
+    let f = first_order(prom, 0, d2)
+    if f.temp < 2000
+        return f.temp - ((f.dt * f.dt) >> 31)
+    f.temp
+
+// The reading for the ADC results `d1` and `d2`, with the second order
+// compensation of Figure 3: the temperature in millidegrees and the
+// pressure in pascals.
+pub fn compensate(prom: Ms5611Prom, d1: Int, d2: Int) -> Ms5611Sample
+    let f = first_order(prom, d1, d2)
+    var temp = f.temp
+    var off = f.off
+    var sens = f.sens
+    if f.temp < 2000
+        let d = f.temp - 2000
+        var off2 = (5 * d * d) >> 1
+        var sens2 = (5 * d * d) >> 2
+        if f.temp < -1500
+            let e = f.temp + 1500
+            off2 = off2 + 7 * e * e
+            sens2 = sens2 + ((11 * e * e) >> 1)
+        temp = f.temp - ((f.dt * f.dt) >> 31)
+        off = f.off - off2
+        sens = f.sens - sens2
+    let p = (((d1 * sens) >> 21) - off) >> 15
+    Ms5611Sample { milli_c: temp * 10, pa: p }
+
+// ── Readings ─────────────────────────────────────────────────────────
+
+// Reads the PROM of a part brought up, resets it first and waits
+// `RESET_US` on `timer`: whether the part answered and the PROM's CRC
+// matched.
+pub fn start<P: Ms5611Port, T: Timer>(p: P, timer: T, var st: Ms5611State) -> Bool [hw]
+    if not p.setup()
+        return false
+    if not part_reset(p)
+        return false
+    timer.delay_us(RESET_US)
+    prom_load(p, var st)
+
+// Reads the PROM into `st` and checks it: whether the part answered and
+// the PROM is valid.  The caller has waited `RESET_US` since the reset.
+pub fn prom_load<P: Ms5611Port>(p: P, var st: Ms5611State) -> Bool [hw]
+    let Some(prom) = prom_read(p) else return false
+    if not prom_valid(prom)
+        return false
+    st.prom = prom
+    true
+
+// The temperature result of the conversion started with the oversampling
+// in `st`, kept in `st` for the pressure: whether there was a result.
+pub fn temperature_take<P: Ms5611Port>(p: P, var st: Ms5611State) -> Bool [hw]
+    let Some(d2) = adc_read(p) else return false
+    st.d2 = d2
+    true
+
+// One reading, blocking on `timer` for the conversions: the pressure at
+// the oversampling in `st`, then the temperature at the same.  `None`
+// when the part refuses a command or has no result, or the PROM was not
+// loaded.
+pub fn measure<P: Ms5611Port, T: Timer>(p: P, timer: T, st: Ms5611State) -> ?Ms5611Sample [hw]
+    if not prom_valid(st.prom)
+        return None
+    let us1 = start_pressure(p, st.osr)
+    if us1 < 0
+        return None
+    timer.delay_us(us1)
+    let Some(d1) = adc_read(p) else return None
+    let us2 = start_temperature(p, st.osr)
+    if us2 < 0
+        return None
+    timer.delay_us(us2)
+    let Some(d2) = adc_read(p) else return None
+    Some(compensate(st.prom, d1, d2))
+
+// The latest pressure of the Barometer: the ADC result of the conversion
+// started with `baro_start`, compensated with the temperature result
+// `take_temperature` kept.  `None` when the PROM was not loaded, no
+// temperature was taken, or the part has no result.
+pub fn baro_read_of<P: Ms5611Port>(p: P, st: Ms5611State) -> ?Pascals [hw]
+    if not prom_valid(st.prom) or st.d2 == 0
+        return None
+    let Some(d1) = adc_read(p) else return None
+    Some(Pascals { pa: compensate(st.prom, d1, st.d2).pa })
+
+// The latest temperature of the Thermometer, from the conversion started
+// with `temp_start`, with the second order term.  `None` when the PROM
+// was not loaded or the part has no result.
+pub fn temp_read_of<P: Ms5611Port>(p: P, st: Ms5611State) -> ?TempMilliC [hw]
+    if not prom_valid(st.prom)
+        return None
+    let Some(d2) = adc_read(p) else return None
+    Some(TempMilliC { milli_c: temperature_centi(st.prom, d2) * 10 })
+
+// ── The part on an I2C bus ───────────────────────────────────────────
+
+// A bus the part is on, I2C: the board's bus with the address in the
+// wiring, 0x76 with CSB high and 0x77 with CSB low.
+pub @value
+struct Ms5611I2c
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Ms5611Port for Ms5611I2c
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
+
+    fn command(self, cmd: Int) -> Bool [hw]
+        i2c_command(self.bus, self.w, cmd)
+
+    fn read(self, cmd: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, cmd, n, var dst)
+
+// An MS5611 on a board's I2C bus.
+pub @value
+struct Ms5611
+    port: Ms5611I2c
+    st: Ms5611State
+
+impl Ms5611
+    // The part at `w.addr` on the board's I2C bus, as a board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Ms5611
+        Ms5611 { port: Ms5611I2c { bus: bus, pins: pins, w: w },
+                 st: Ms5611State { prom: prom_empty(), osr: OSR_DEFAULT, d2: 0 } }
+
+    // Brings the part up: the bus made ready, the part reset, the wait
+    // for the reload on `timer`, and the PROM read and checked.
+    fn begin(var self, timer: BoardTimer) -> Bool [hw]
+        // workaround(a-generic-method-instantiated-from-another-module-calls-its-modules-generic-function-unspecialised): a method takes the board's timer, not a type parameter; the generic form is `start`.
+        start(self.port, timer, var self.st)
+
+    // Resets the part; the caller waits `RESET_US`, then calls `load_prom`.
+    fn reset(self) -> Bool [hw]
+        part_reset(self.port)
+
+    // Reads and checks the PROM.
+    fn load_prom(var self) -> Bool [hw]
+        prom_load(self.port, var self.st)
+
+    // The PROM the driver holds; eight zero words before `begin`.
+    fn prom(self) -> Ms5611Prom
+        self.st.prom
+
+    // Sets the oversampling code, 0 to 4 for OSR 256 to 4096: whether it
+    // is one.
+    fn set_osr(var self, osr: Int) -> Bool
+        if osr < 0 or osr > 4
+            return false
+        self.st.osr = osr
+        true
+
+    // The oversampling code in use.
+    fn osr(self) -> Int
+        self.st.osr
+
+    // The temperature result of the conversion `temp_start` began, kept
+    // for `baro_read`: whether there was a result.
+    fn take_temperature(var self) -> Bool [hw]
+        temperature_take(self.port, var self.st)
+
+    // One reading, blocking on `timer` for both conversions.
+    fn sample(self, timer: BoardTimer) -> ?Ms5611Sample [hw]
+        // workaround(a-generic-method-instantiated-from-another-module-calls-its-modules-generic-function-unspecialised): a method takes the board's timer, not a type parameter; the generic form is `measure`.
+        measure(self.port, timer, self.st)
+
+impl Barometer[hw] for Ms5611
+    // Starts the pressure conversion and answers its time in
+    // microseconds, -1 when the part did not acknowledge.
+    fn baro_start(self) -> Int [hw]
+        start_pressure(self.port, self.st.osr)
+
+    // The pressure in pascals, with the temperature `take_temperature`
+    // kept; `None` before one was taken.
+    fn baro_read(self) -> ?Pascals [hw]
+        baro_read_of(self.port, self.st)
+
+impl Thermometer[hw] for Ms5611
+    // Starts the temperature conversion and answers its time in
+    // microseconds, -1 when the part did not acknowledge.
+    fn temp_start(self) -> Int [hw]
+        start_temperature(self.port, self.st.osr)
+
+    // The temperature in millidegrees, with the second order term.
+    fn temp_read(self) -> ?TempMilliC [hw]
+        temp_read_of(self.port, self.st)
+
+// ── The part on an SPI bus ───────────────────────────────────────────
+
+// A bus the part is on, SPI: the board's bus with the chip select in the
+// wiring.
+pub @value
+struct Ms5611SpiPort
+    bus: BoardSpi
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Ms5611Port for Ms5611SpiPort
+    fn setup(self) -> Bool [hw]
+        spi_setup(self.bus, self.pins, self.w)
+
+    fn command(self, cmd: Int) -> Bool [hw]
+        spi_command(self.bus, self.pins, self.w, cmd)
+
+    fn read(self, cmd: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        spi_read_into(self.bus, self.pins, self.w, cmd, n, var dst)
+
+// An MS5611 on a board's SPI bus.
+pub @value
+struct Ms5611Spi
+    port: Ms5611SpiPort
+    st: Ms5611State
+
+impl Ms5611Spi
+    // The part with the chip select `w.cs` on the board's SPI bus, as a
+    // board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Ms5611Spi
+        Ms5611Spi { port: Ms5611SpiPort { bus: bus, pins: pins, w: w },
+                    st: Ms5611State { prom: prom_empty(), osr: OSR_DEFAULT, d2: 0 } }
+
+    // Brings the part up (`start`).
+    fn begin(var self, timer: BoardTimer) -> Bool [hw]
+        // workaround(a-generic-method-instantiated-from-another-module-calls-its-modules-generic-function-unspecialised): a method takes the board's timer, not a type parameter; the generic form is `start`.
+        start(self.port, timer, var self.st)
+
+    // Resets the part; the caller waits `RESET_US`, then calls `load_prom`.
+    fn reset(self) -> Bool [hw]
+        part_reset(self.port)
+
+    // Reads and checks the PROM.
+    fn load_prom(var self) -> Bool [hw]
+        prom_load(self.port, var self.st)
+
+    // The PROM the driver holds; eight zero words before `begin`.
+    fn prom(self) -> Ms5611Prom
+        self.st.prom
+
+    // Sets the oversampling code, 0 to 4 for OSR 256 to 4096.
+    fn set_osr(var self, osr: Int) -> Bool
+        if osr < 0 or osr > 4
+            return false
+        self.st.osr = osr
+        true
+
+    // The oversampling code in use.
+    fn osr(self) -> Int
+        self.st.osr
+
+    // The temperature result kept for `baro_read`.
+    fn take_temperature(var self) -> Bool [hw]
+        temperature_take(self.port, var self.st)
+
+    // One reading, blocking on `timer` for both conversions.
+    fn sample(self, timer: BoardTimer) -> ?Ms5611Sample [hw]
+        // workaround(a-generic-method-instantiated-from-another-module-calls-its-modules-generic-function-unspecialised): a method takes the board's timer, not a type parameter; the generic form is `measure`.
+        measure(self.port, timer, self.st)
+
+impl Barometer[hw] for Ms5611Spi
+    // Starts the pressure conversion and answers its time.
+    fn baro_start(self) -> Int [hw]
+        start_pressure(self.port, self.st.osr)
+
+    // The pressure in pascals, with the temperature kept.
+    fn baro_read(self) -> ?Pascals [hw]
+        baro_read_of(self.port, self.st)
+
+impl Thermometer[hw] for Ms5611Spi
+    // Starts the temperature conversion and answers its time.
+    fn temp_start(self) -> Int [hw]
+        start_temperature(self.port, self.st.osr)
+
+    // The temperature in millidegrees.
+    fn temp_read(self) -> ?TempMilliC [hw]
+        temp_read_of(self.port, self.st)

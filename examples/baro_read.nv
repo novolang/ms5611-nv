@@ -1,0 +1,62 @@
+/* baro_read.nv: a reading loop for an MS5611 on a breakout, for an nRF52840
+ * DK or an nRF54LM20 DK
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          ms5611-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The breakout's SDA and SCL go to the board's I2C pins, its PS pin to
+ * the supply (which selects I2C), and its CSB pin to the supply, which
+ * puts the part at 0x76; CSB to ground puts it at 0x77.  The program
+ * brings the part up, which resets it, waits 3 ms for the PROM to reload,
+ * reads the eight PROM words and checks their CRC-4, and once a second
+ * converts the pressure and then the temperature at OSR 4096, waiting
+ * the 9.04 ms each takes, and prints one line over RTT:
+ *
+ *     ms5611 mC=<millidegrees> Pa=<pascals>
+ *
+ * At sea level the pressure is about 101 325 Pa.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the GPIO, the UART
+ * and the timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints
+ * "ms5611: no answer" until a board package names one with `@hal(i2c)`.
+ * The part has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer }
+use dev_bus
+use ms5611.{ Ms5611 }
+
+// The part's address with CSB high.
+const ADDR = 0x76
+
+// A label and a number, written without building a string.
+@tier(embedded)
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    var part = Ms5611.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    let timer = BoardTimer { id: 0 }
+    if not part.begin(timer)
+        hal.uart.write("ms5611: no answer\n")
+        return
+    loop
+        match part.sample(timer)
+            Some(s) =>
+                hal.uart.write("ms5611")
+                field(" mC=", s.milli_c)
+                field(" Pa=", s.pa)
+                hal.uart.write("\n")
+            None =>
+                hal.uart.write("ms5611: no result\n")
+        hal.timer.delay_ms(1000)
