@@ -42,7 +42,8 @@ pressure sensor on an I2C or an SPI bus.
   minus infinity), as in Linux; Zephyr's MS5607 driver divides (round
   toward zero).  The two differ by one count below 20 °C.
 - No async form: `async fn` is refused at the embedded tier.
-- The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for I2C and SPI as absent hardware: on those
-  images `begin` answers `false` until the boards drive the buses.  The
-  gap is tracked by `features/embedded-devex/nordic-twim-i2c-driver.md`.
+- The device program builds for the nRF52840 DK and the nRF54LM20 DK, which
+  drive I2C with TWIM0 and TWIM22, so their images carry the reading path:
+  22,136 and 23,112 bytes of flash, where before the Nordic buses landed they
+  were 12,944 and 13,700 bytes.  A reply from the part over either bus is
+  NOT VERIFIED.
