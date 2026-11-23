@@ -1,6 +1,6 @@
 [package]
 name        = "ms5611-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for TE Connectivity's MS5611-01BA03 barometric pressure sensor on an I2C or an SPI bus: the reset, the PROM and its CRC-4 check, the pressure and temperature conversions at the five oversampling ratios with their conversion times, and the data sheet's first and second order compensation in integers, as devices-nv's Barometer and Thermometer."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -28,8 +28,9 @@ tier = "embedded"
 [dependencies]
 # The board's I2C bus, SPI bus, GPIO and timer handles, and the I2cBus,
 # SpiBus, GpioOut and Timer traits they implement.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
-# helpers, and the Barometer and Thermometer traits.  Both exist in 0.3.2;
-# the registry's newest devices-nv is 0.3.2, so this is a registry range.
-devices-nv      = "^0.3.2"
+# helpers, and the Barometer and Thermometer traits.  Both are registry
+# ranges: a path dependency here would make devices-nv's own range a second
+# package.
+devices-nv      = "^0.4.0"
